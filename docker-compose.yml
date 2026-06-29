@@ -1,0 +1,317 @@
+version: '3.9'
+
+services:
+  # ─── Infrastructure ────────────────────────────────────────────
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.1
+    container_name: redpanda
+    hostname: redpanda
+    command:
+      - redpanda start
+      - --smp 1
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --pandaproxy-addr 0.0.0.0:8082
+      - --advertise-pandaproxy-addr redpanda:8082
+      - --set redpanda.auto_create_topics_enabled=true
+      - --set redpanda.transaction_coordinator_replication=1
+      - --set redpanda.id_allocator_replication=1
+    ports:
+      - "19092:19092"
+      - "9092:9092"
+      - "8082:8082"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - microservices
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  init-kafka:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.1
+    container_name: init-kafka
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Creating Kafka topics..."
+        rpk topic create orders.created --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create orders.cancelled --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create payments.processed --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create payments.refunded --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create inventory.reserved --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create inventory.released --brokers redpanda:9092 -p 6 -r 1 || true
+        rpk topic create notifications.sent --brokers redpanda:9092 -p 3 -r 1 || true
+        rpk topic create dead-letter --brokers redpanda:9092 -p 3 -r 1 || true
+        echo "All topics created successfully"
+    networks:
+      - microservices
+
+  postgres-orders:
+    image: postgres:15-alpine
+    container_name: postgres-orders
+    hostname: postgres-orders
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: order_user
+      POSTGRES_PASSWORD: order_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-orders-data:/var/lib/postgresql/data
+      - ./services/order-service/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - microservices
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U order_user -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-payments:
+    image: postgres:15-alpine
+    container_name: postgres-payments
+    hostname: postgres-payments
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-payments-data:/var/lib/postgresql/data
+      - ./services/payment-service/migrations:/docker-entrypoint-initdb.d
+    networks:
+      - microservices
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_user -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - microservices
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Core Services ─────────────────────────────────────────────
+
+  order-service:
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    container_name: order-service
+    hostname: order-service
+    environment:
+      SERVICE_NAME: order-service
+      HTTP_PORT: 8081
+      DB_HOST: postgres-orders
+      DB_PORT: 5432
+      DB_NAME: orders
+      DB_USER: order_user
+      DB_PASSWORD: order_pass
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_ORDERS_CREATED: orders.created
+      KAFKA_TOPIC_ORDERS_CANCELLED: orders.cancelled
+      KAFKA_TOPIC_PAYMENTS_PROCESSED: payments.processed
+      KAFKA_TOPIC_INVENTORY_RESERVED: inventory.reserved
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOG_LEVEL: info
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres-orders:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: services/payment-service/Dockerfile
+    container_name: payment-service
+    hostname: payment-service
+    environment:
+      SERVICE_NAME: payment-service
+      HTTP_PORT: 8082
+      DB_HOST: postgres-payments
+      DB_PORT: 5432
+      DB_NAME: payments
+      DB_USER: payment_user
+      DB_PASSWORD: payment_pass
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_PAYMENTS_PROCESSED: payments.processed
+      KAFKA_TOPIC_PAYMENTS_REFUNDED: payments.refunded
+      KAFKA_TOPIC_ORDERS_CREATED: orders.created
+      KAFKA_TOPIC_ORDERS_CANCELLED: orders.cancelled
+      LOG_LEVEL: info
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres-payments:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    networks:
+      - microservices
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: services/inventory-service/Dockerfile
+    container_name: inventory-service
+    hostname: inventory-service
+    environment:
+      SERVICE_NAME: inventory-service
+      HTTP_PORT: 8083
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_ORDERS_CREATED: orders.created
+      KAFKA_TOPIC_ORDERS_CANCELLED: orders.cancelled
+      KAFKA_TOPIC_PAYMENTS_PROCESSED: payments.processed
+      KAFKA_TOPIC_INVENTORY_RESERVED: inventory.reserved
+      KAFKA_TOPIC_INVENTORY_RELEASED: inventory.released
+      LOG_LEVEL: info
+    ports:
+      - "8083:8083"
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    networks:
+      - microservices
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    container_name: notification-service
+    hostname: notification-service
+    environment:
+      SERVICE_NAME: notification-service
+      HTTP_PORT: 8084
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC_NOTIFICATIONS_SENT: notifications.sent
+      LOG_LEVEL: info
+    ports:
+      - "8084:8084"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      init-kafka:
+        condition: service_completed_successfully
+    networks:
+      - microservices
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8084/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── API Gateway ───────────────────────────────────────────────
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    container_name: api-gateway
+    hostname: api-gateway
+    environment:
+      SERVICE_NAME: api-gateway
+      HTTP_PORT: 8080
+      ORDER_SERVICE_URL: http://order-service:8081
+      PAYMENT_SERVICE_URL: http://payment-service:8082
+      INVENTORY_SERVICE_URL: http://inventory-service:8083
+      NOTIFICATION_SERVICE_URL: http://notification-service:8084
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      order-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    networks:
+      - microservices
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  microservices:
+    driver: bridge
+    name: microservices
+
+volumes:
+  redpanda-data:
+    driver: local
+  postgres-orders-data:
+    driver: local
+  postgres-payments-data:
+    driver: local
+  redis-data:
+    driver: local
